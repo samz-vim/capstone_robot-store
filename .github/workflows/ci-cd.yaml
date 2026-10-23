@@ -1,161 +1,119 @@
-
-name: Robot Store CI/CD and Monitoring
+name: Robot Store CI-CD and Observability
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - master
+    paths:
+      - 'scripts/**'
+      - 'monitoring/**'
+      - 'tracing/**'
+      - 'docs/**'
+      - 'README.md'
+      - '.github/workflows/ci-cd.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: robot-store-production
+  group: robot-store-deployment
   cancel-in-progress: false
 
 jobs:
   validate:
-    name: Validate configuration
+    name: Validate project configuration
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout root project
         uses: actions/checkout@v4
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4
-
-      - name: Validate Robot Shop chart
+      - name: Validate shell scripts
+        shell: bash
         run: |
-          test -f upstream-robot-shop/K8s/helm/Chart.yaml
-          helm dependency build ./upstream-robot-shop/K8s/helm
-          helm lint ./upstream-robot-shop/K8s/helm
-          helm template robot-shop ./upstream-robot-shop/K8s/helm \
-            --namespace robot-shop > /tmp/robot-shop.yaml
+          set -euo pipefail
+          bash -n scripts/*.sh
+          echo "Shell syntax validation passed."
 
-      - name: Validate monitoring configuration
+      - name: Validate YAML files
         run: |
-          test -f monitoring/prometheus-values.yaml
-          grep -q 'grafana:' monitoring/prometheus-values.yaml
-          grep -q 'prometheus:' monitoring/prometheus-values.yaml
+          python -m pip install --quiet pyyaml
+          python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          files = [
+              *Path("monitoring").glob("*.yaml"),
+              *Path("tracing").glob("*.yaml"),
+          ]
+
+          for file in files:
+              with file.open(encoding="utf-8") as stream:
+                  list(yaml.safe_load_all(stream))
+              print(f"Valid YAML: {file}")
+
+          if not files:
+              raise SystemExit("No monitoring or tracing YAML files found.")
+          PY
+
+      - name: Check required deployment files
+        run: |
+          set -euo pipefail
+          test -f scripts/10-deploy-robot-shop.sh
+          test -f scripts/20-deploy-observability.sh
+          test -f scripts/30-verify.sh
+          test -f monitoring/kube-prometheus-stack-values.yaml
+          test -f monitoring/loki-values.yaml
+          test -f monitoring/fluent-bit-values.yaml
+          test -f monitoring/robot-shop-alerts.yaml
+          test -f tracing/jaeger-all-in-one.yaml
+          echo "Required project files are present."
 
   deploy:
-    name: Deploy to connected EC2 instance
+    name: Deploy to existing K3s cluster
     needs: validate
     runs-on: ubuntu-latest
     environment: production
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Deploy application and observability stack over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
+          command_timeout: 30m
+          script: |
+            set -eu
+            cd "$HOME/robot-store"
 
-      - name: Install Helm
-        uses: azure/setup-helm@v4
+            echo "=== Confirming K3s and tools ==="
+            sudo kubectl get nodes
+            helm version --short
 
-      - name: Configure SSH
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
-        run: |
-          set -eu
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
+            echo "=== Updating root project ==="
+            git fetch origin
+            BRANCH="${{ github.ref_name }}"
+            git pull --ff-only origin "$BRANCH"
 
-          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
+            chmod +x scripts/*.sh
 
-          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
+            echo "=== Checking prerequisites ==="
+            ./scripts/00-check-prerequisites.sh
 
-          ssh -i ~/.ssh/deploy_key \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes \
-            "$EC2_USER@$EC2_HOST" \
-            'echo SSH connection successful'
+            echo "=== Deploying Robot Shop ==="
+            ./scripts/10-deploy-robot-shop.sh
 
-      - name: Package deployment files
-        run: |
-          mkdir -p release/helm
-          cp -a upstream-robot-shop/K8s/helm release/helm/robot-shop
-          cp monitoring/prometheus-values.yaml release/
-          tar -czf release.tar.gz -C release .
+            echo "=== Deploying monitoring, logs, alerts and tracing ==="
+            ./scripts/20-deploy-observability.sh
 
-      - name: Copy files to EC2
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-        run: |
-          scp -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=yes \
-            release.tar.gz \
-            "$EC2_USER@$EC2_HOST:/tmp/robot-store-release.tar.gz"
+            echo "=== Waiting for workload rollout ==="
+            sudo kubectl rollout status deployment/jaeger -n tracing --timeout=300s
 
-      - name: Deploy application and monitoring
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
-          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-        run: |
-          set -eu
+            echo "=== Verifying application and observability ==="
+            ./scripts/30-verify.sh
 
-          # Base64 avoids placing the raw password in the remote command.
-          PASSWORD_B64="$(printf '%s' "$GRAFANA_ADMIN_PASSWORD" | base64 -w0)"
-
-          ssh -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=yes \
-            "$EC2_USER@$EC2_HOST" \
-            "GRAFANA_PASSWORD_B64='$PASSWORD_B64' bash -s" <<'REMOTE'
-          set -eu
-
-          export KUBECONFIG="$HOME/.kube/config"
-
-          test -r "$KUBECONFIG"
-          kubectl get nodes
-          df -h /
-
-          WORKDIR="$(mktemp -d "$HOME/robot-store-deploy.XXXXXX")"
-          trap 'rm -rf "$WORKDIR"' EXIT
-
-          tar -xzf /tmp/robot-store-release.tar.gz -C "$WORKDIR"
-
-          # Install or update the application.
-          helm dependency build "$WORKDIR/helm/robot-shop"
-
-          helm upgrade --install robot-shop \
-            "$WORKDIR/helm/robot-shop" \
-            --namespace robot-shop \
-            --create-namespace \
-            --wait \
-            --timeout 10m
-
-          # Install or update the monitoring stack.
-          helm repo add prometheus-community \
-            https://prometheus-community.github.io/helm-charts \
-            --force-update
-          helm repo update
-
-          kubectl create namespace monitoring \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-          GRAFANA_PASSWORD="$(printf '%s' "$GRAFANA_PASSWORD_B64" | base64 -d)"
-          test -n "$GRAFANA_PASSWORD"
-
-          helm upgrade --install monitoring \
-            prometheus-community/kube-prometheus-stack \
-            --namespace monitoring \
-            -f "$WORKDIR/prometheus-values.yaml" \
-            --set-string grafana.adminPassword="$GRAFANA_PASSWORD" \
-            --wait \
-            --timeout 15m
-
-          # Verify application and monitoring resources.
-          kubectl get pods -n robot-shop
-          kubectl get svc -n robot-shop
-          kubectl get pods -n monitoring
-          kubectl get svc -n monitoring
-
-          kubectl rollout status deployment \
-            -n monitoring --timeout=180s
-          REMOTE
+            echo "=== Deployment commands completed ==="
