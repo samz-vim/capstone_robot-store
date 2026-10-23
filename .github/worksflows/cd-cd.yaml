@@ -1,0 +1,161 @@
+
+name: Robot Store CI/CD and Monitoring
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: robot-store-production
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate configuration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Validate Robot Shop chart
+        run: |
+          test -f upstream-robot-shop/K8s/helm/Chart.yaml
+          helm dependency build ./upstream-robot-shop/K8s/helm
+          helm lint ./upstream-robot-shop/K8s/helm
+          helm template robot-shop ./upstream-robot-shop/K8s/helm \
+            --namespace robot-shop > /tmp/robot-shop.yaml
+
+      - name: Validate monitoring configuration
+        run: |
+          test -f monitoring/prometheus-values.yaml
+          grep -q 'grafana:' monitoring/prometheus-values.yaml
+          grep -q 'prometheus:' monitoring/prometheus-values.yaml
+
+  deploy:
+    name: Deploy to connected EC2 instance
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Configure SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/deploy_key \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            'echo SSH connection successful'
+
+      - name: Package deployment files
+        run: |
+          mkdir -p release/helm
+          cp -a upstream-robot-shop/K8s/helm release/helm/robot-shop
+          cp monitoring/prometheus-values.yaml release/
+          tar -czf release.tar.gz -C release .
+
+      - name: Copy files to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            release.tar.gz \
+            "$EC2_USER@$EC2_HOST:/tmp/robot-store-release.tar.gz"
+
+      - name: Deploy application and monitoring
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        run: |
+          set -eu
+
+          # Base64 avoids placing the raw password in the remote command.
+          PASSWORD_B64="$(printf '%s' "$GRAFANA_ADMIN_PASSWORD" | base64 -w0)"
+
+          ssh -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "GRAFANA_PASSWORD_B64='$PASSWORD_B64' bash -s" <<'REMOTE'
+          set -eu
+
+          export KUBECONFIG="$HOME/.kube/config"
+
+          test -r "$KUBECONFIG"
+          kubectl get nodes
+          df -h /
+
+          WORKDIR="$(mktemp -d "$HOME/robot-store-deploy.XXXXXX")"
+          trap 'rm -rf "$WORKDIR"' EXIT
+
+          tar -xzf /tmp/robot-store-release.tar.gz -C "$WORKDIR"
+
+          # Install or update the application.
+          helm dependency build "$WORKDIR/helm/robot-shop"
+
+          helm upgrade --install robot-shop \
+            "$WORKDIR/helm/robot-shop" \
+            --namespace robot-shop \
+            --create-namespace \
+            --wait \
+            --timeout 10m
+
+          # Install or update the monitoring stack.
+          helm repo add prometheus-community \
+            https://prometheus-community.github.io/helm-charts \
+            --force-update
+          helm repo update
+
+          kubectl create namespace monitoring \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          GRAFANA_PASSWORD="$(printf '%s' "$GRAFANA_PASSWORD_B64" | base64 -d)"
+          test -n "$GRAFANA_PASSWORD"
+
+          helm upgrade --install monitoring \
+            prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            -f "$WORKDIR/prometheus-values.yaml" \
+            --set-string grafana.adminPassword="$GRAFANA_PASSWORD" \
+            --wait \
+            --timeout 15m
+
+          # Verify application and monitoring resources.
+          kubectl get pods -n robot-shop
+          kubectl get svc -n robot-shop
+          kubectl get pods -n monitoring
+          kubectl get svc -n monitoring
+
+          kubectl rollout status deployment \
+            -n monitoring --timeout=180s
+          REMOTE
