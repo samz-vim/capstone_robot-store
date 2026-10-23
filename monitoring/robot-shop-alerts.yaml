@@ -1,0 +1,27 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: robot-shop-lab-alerts
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: robot-shop-availability
+      rules:
+        - alert: KubernetesPodNotReady
+          expr: kube_pod_status_ready{condition="true",namespace="robot-shop"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A Robot Shop pod is not ready"
+            description: "A pod in namespace robot-shop has not been ready for 5 minutes."
+        - alert: KubernetesContainerRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="robot-shop"}[10m]) > 2
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Robot Shop container restarts"
+            description: "A container restarted more than twice over 10 minutes."
