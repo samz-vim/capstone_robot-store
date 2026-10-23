@@ -1,17 +1,8 @@
-name: Robot Store CI-CD and Observability
+name: Robot Store CI/CD
 
 on:
   push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'scripts/**'
-      - 'monitoring/**'
-      - 'tracing/**'
-      - 'docs/**'
-      - 'README.md'
-      - '.github/workflows/ci-cd.yml'
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
@@ -21,64 +12,141 @@ concurrency:
   group: robot-store-deployment
   cancel-in-progress: false
 
+env:
+  APP_COMMIT: 55292e2199f2fb00a165b1f7d3045fe7f8922038
+
 jobs:
-  validate:
-    name: Validate project configuration
+  build:
+    name: Build and push Robot Shop images
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout root project
+      - name: Checkout project
         uses: actions/checkout@v4
 
-      - name: Validate shell scripts
-        shell: bash
+      - name: Checkout Instana Robot Shop source
+        uses: actions/checkout@v4
+        with:
+          repository: instana/robot-shop
+          ref: 55292e2199f2fb00a165b1f7d3045fe7f8922038
+          path: app
+
+      - name: Verify source files
         run: |
           set -euo pipefail
-          bash -n scripts/*.sh
-          echo "Shell syntax validation passed."
+          test -f app/docker-compose.yaml
+          test -f app/K8s/helm/Chart.yaml
+          echo "Robot Shop source and chart found."
 
-      - name: Validate YAML files
-        run: |
-          python -m pip install --quiet pyyaml
-          python - <<'PY'
-          from pathlib import Path
-          import yaml
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
-          files = [
-              *Path("monitoring").glob("*.yaml"),
-              *Path("tracing").glob("*.yaml"),
-          ]
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-          for file in files:
-              with file.open(encoding="utf-8") as stream:
-                  list(yaml.safe_load_all(stream))
-              print(f"Valid YAML: {file}")
-
-          if not files:
-              raise SystemExit("No monitoring or tracing YAML files found.")
-          PY
-
-      - name: Check required deployment files
+      - name: Build custom images
+        working-directory: app
+        env:
+          REPO: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -euo pipefail
-          test -f scripts/10-deploy-robot-shop.sh
-          test -f scripts/20-deploy-observability.sh
-          test -f scripts/30-verify.sh
-          test -f monitoring/kube-prometheus-stack-values.yaml
-          test -f monitoring/loki-values.yaml
-          test -f monitoring/fluent-bit-values.yaml
-          test -f monitoring/robot-shop-alerts.yaml
-          test -f tracing/jaeger-all-in-one.yaml
-          echo "Required project files are present."
+          docker compose -f docker-compose.yaml config --quiet
+          docker compose -f docker-compose.yaml build \
+            mongodb catalogue user cart mysql shipping ratings payment dispatch web
+
+      - name: Push custom images
+        working-directory: app
+        env:
+          REPO: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yaml push \
+            mongodb catalogue user cart mysql shipping ratings payment dispatch web
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-shop-chart
+          path: app/K8s/helm/
+          include-hidden-files: true
+
+  render:
+    name: Render Kubernetes manifests
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Checkout Robot Shop source
+        uses: actions/checkout@v4
+        with:
+          repository: instana/robot-shop
+          ref: 55292e2199f2fb00a165b1f7d3045fe7f8922038
+          path: app
+
+      - name: Install Helm renderer
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+
+      - name: Render chart as plain Kubernetes YAML
+        env:
+          REPO: ${{ secrets.DOCKERHUB_USERNAME }}
+          TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${TAG::12}"
+
+          helm template robot-shop app/K8s/helm \
+            --namespace robot-shop \
+            --set image.repo="$REPO" \
+            --set image.version="$IMAGE_TAG" \
+            --set redis.storageClassName=local-path \
+            > robot-shop-rendered.yaml
+
+          test -s robot-shop-rendered.yaml
+          echo "Rendered Kubernetes manifests:"
+          grep -E '^[[:space:]]*image:' robot-shop-rendered.yaml | sort -u
+
+      - name: Upload rendered manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-shop-manifests
+          path: robot-shop-rendered.yaml
 
   deploy:
-    name: Deploy to existing K3s cluster
-    needs: validate
+    name: Deploy to K3s and observability
+    needs: render
     runs-on: ubuntu-latest
     environment: production
 
     steps:
-      - name: Deploy application and observability stack over SSH
+      - name: Download rendered manifests
+        uses: actions/download-artifact@v4
+        with:
+          name: robot-shop-manifests
+          path: deployment
+
+      - name: Copy manifests to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          fingerprint: ${{ secrets.EC2_HOST_FINGERPRINT }}
+          source: deployment/robot-shop-rendered.yaml
+          target: /tmp/
+          strip_components: 1
+
+      - name: Apply Kubernetes manifests
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -90,30 +158,38 @@ jobs:
             set -eu
             cd "$HOME/robot-store"
 
-            echo "=== Confirming K3s and tools ==="
+            echo "=== Check K3s ==="
             sudo kubectl get nodes
-            helm version --short
 
-            echo "=== Updating root project ==="
-            git fetch origin
-            BRANCH="${{ github.ref_name }}"
-            git pull --ff-only origin "$BRANCH"
+            echo "=== Create application namespace ==="
+            sudo kubectl create namespace robot-shop \
+              --dry-run=client -o yaml | sudo kubectl apply -f -
 
+            echo "=== Deploy application using kubectl ==="
+            sudo kubectl apply -n robot-shop \
+              -f /tmp/robot-shop-rendered.yaml
+
+            echo "=== Update monitoring and tracing ==="
             chmod +x scripts/*.sh
+            sudo bash scripts/20-deploy-observability.sh
 
-            echo "=== Checking prerequisites ==="
-            ./scripts/00-check-prerequisites.sh
+            echo "=== Check application deployments ==="
+            for deployment in $(sudo kubectl get deployments \
+              -n robot-shop -o name); do
+              sudo kubectl rollout status -n robot-shop \
+                "$deployment" --timeout=300s
+            done
 
-            echo "=== Deploying Robot Shop ==="
-            ./scripts/10-deploy-robot-shop.sh
+            echo "=== Check Jaeger ==="
+            sudo kubectl rollout status deployment/jaeger \
+              -n tracing --timeout=300s
 
-            echo "=== Deploying monitoring, logs, alerts and tracing ==="
-            ./scripts/20-deploy-observability.sh
+            echo "=== Verify all project components ==="
+            sudo bash scripts/30-verify.sh
 
-            echo "=== Waiting for workload rollout ==="
-            sudo kubectl rollout status deployment/jaeger -n tracing --timeout=300s
+            echo "=== Final pod status ==="
+            sudo kubectl get pods -n robot-shop
+            sudo kubectl get pods -n monitoring
+            sudo kubectl get pods -n tracing
 
-            echo "=== Verifying application and observability ==="
-            ./scripts/30-verify.sh
-
-            echo "=== Deployment commands completed ==="
+            echo "Deployment completed."
