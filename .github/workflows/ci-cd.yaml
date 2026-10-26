@@ -31,6 +31,14 @@ jobs:
           ref: 55292e2199f2fb00a165b1f7d3045fe7f8922038
           path: app
 
+      
+      - name: Fix unavailable OpenJDK base image
+        run: |
+          set -euo pipefail
+          sed -i 's|^FROM openjdk:8-jdk$|FROM eclipse-temurin:8-jdk|' app/shipping/Dockerfile
+          grep -n '^FROM ' app/shipping/Dockerfile
+
+
       - name: Verify source files
         run: |
           set -euo pipefail
